@@ -43,4 +43,4 @@ This repository uses testing libraries such as cypress, jest, storybook. Also hu
 - [Jest](https://jestjs.io/) - Specialy to do unit tests for functions and components.
 - [Storybook](https://storybook.js.org/) - Test your components without complicate configurations divide and isolate them.
 - [Husky](https://www.npmjs.com/package/husky) - Create actions to build pre-commit and push-commit.
-# nextjs-app
+
