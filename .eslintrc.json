@@ -1,0 +1,5 @@
+{
+  "extends": ["next", "next/core-web-vitals", "eslint:recommended", "plugin:storybook/recommended", "prettier"],
+  "root": true,
+  "env": { "node": true, "jest": true }
+}

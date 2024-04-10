@@ -1,0 +1,159 @@
+version: 2.1
+orbs:
+  aws-cli: circleci/aws-cli@1.2.1
+  slack: circleci/slack@4.9.3
+
+commands:
+  install-dependencies:
+    description: 'Installs yarn dependencies for Cypress docker image'
+    steps:
+      - checkout
+      - run: echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" > ~/.npmrc
+      - restore_cache:
+          key: dependency-cache-v5-yarn-{{ checksum "yarn.lock" }}
+      - run:
+          name: Install dependencies
+          command: yarn install --frozen-lockfile
+      - save_cache:
+          key: dependency-cache-v5-yarn-{{ checksum "yarn.lock" }}
+          paths:
+            - node_modules
+            - /root/.cache
+
+  check-skip-cypress-tests:
+    steps:
+      - checkout
+      - run:
+          name: Check for Skipped Cypress tests
+          command: |
+            echo 'List of cypress skip tests'
+            grep -Rn cypress -e '.skip(' || echo "There are not skipped tests"
+
+            COUNT_SKIP=$( grep -R cypress -e '.skip(' |wc -l ||true )
+            echo "Count of skipped tests $COUNT_SKIP"
+            echo "Count of allowed skipped tests $CYPRESS_SKIPS_ALLOWED"
+
+            if  (( $COUNT_SKIP > $CYPRESS_SKIPS_ALLOWED )); then
+              exit 1
+            fi;
+
+  assume-role:
+    description: Installs AWS CLI, setup the IAM user keys and assume specified role
+    parameters:
+      role-arn:
+        description: Role arn
+        type: string
+    steps:
+      - aws-cli/install
+      - run:
+          name: Setup security IAM credentials
+          command: |
+            aws configure set aws_access_key_id $DEPLOY_AWS_ACCESS_KEY_ID && \
+            aws configure set aws_secret_access_key $DEPLOY_AWS_SECRET_ACCESS_KEY
+            aws configure set region eu-west-1
+      - run:
+          name: Assume role
+          command: |
+            temp_role=$(aws sts assume-role --role-arn << parameters.role-arn>> --role-session-name "CircleCI") && \
+            unset AWS_SECRET_ACCESS_KEY && \
+            unset AWS_ACCESS_KEY_ID && \
+            aws configure set aws_access_key_id $(echo $temp_role | jq .Credentials.AccessKeyId | xargs) && \
+            aws configure set aws_secret_access_key $(echo $temp_role | jq .Credentials.SecretAccessKey | xargs) && \
+            aws configure set aws_session_token $(echo $temp_role | jq .Credentials.SessionToken | xargs) && \
+            export AWS_ACCESS_KEY_ID=$(echo $temp_role | jq -r .Credentials.AccessKeyId) && \
+            export AWS_SECRET_ACCESS_KEY=$(echo $temp_role | jq -r .Credentials.SecretAccessKey) && \
+            export AWS_SESSION_TOKEN=$(echo $temp_role | jq -r .Credentials.SessionToken)
+
+jobs:
+  notify-master-deploy:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - slack/notify:
+          channel: 'deployment-notifications'
+          event: pass
+          template: success_tagged_deploy_1
+
+  integration-test:
+    docker:
+      - image: cypress/base:12.4.0
+    parallelism: 1
+    steps:
+      - install-dependencies
+      - check-skip-cypress-tests
+      - run: npx eslint .
+      - run:
+          name: Start e2e server
+          command: npm start
+          background: true
+      # wait for the server to start responding.
+      - run:
+          shell: /bin/sh
+          command: |
+            wget --retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 -t 10 http://127.0.0.1:21002/
+      - run: npx cypress run --record --parallel --key c13fdab4-1f06-440f-8aa5-09bae88c61d2
+
+  deploy:
+    docker:
+      - image: cimg/node:12.4.0
+    parameters:
+      environment:
+        description: Environment (staging or production)
+        type: string
+    steps:
+      - install-dependencies
+      - assume-role:
+          role-arn: $SHARED_SERVICES_DEPLOY_ROLE_ARN
+      - run: echo "export REACT_APP_VERSION=$(git rev-parse --short HEAD)" >> $BASH_ENV
+      - run: CI=false && yarn run build
+      - run: echo $REACT_APP_VERSION > build/version.txt
+      - run: aws s3 sync build "s3://blaze-frontend/admin/<<parameters.environment>>/latest" --exclude "*/*.map" --exclude "index.html" --cache-control public,max-age=3600 --acl public-read
+      - run: aws s3 sync build "s3://blaze-frontend/admin/<<parameters.environment>>/latest" --exclude "*/*.map" --include "index.html" --cache-control public,max-age=3600 --acl public-read
+      - run: node purge-cache.js <<parameters.environment>>
+
+workflows:
+  version: 2.1
+  build:
+    jobs:
+      - integration-test
+      - deploy:
+          requires:
+            - integration-test
+          name: deploy-prod
+          environment: prod
+          context: aws-deployments
+          filters:
+            branches:
+              only:
+                - master
+
+      - notify-master-deploy:
+          context: slack-secrets
+          requires:
+            - deploy-prod
+          filters:
+            branches:
+              only:
+                - master
+
+      - deploy:
+          name: deploy-canary
+          environment: canary
+          context: aws-deployments
+          requires:
+            - integration-test
+          filters:
+            branches:
+              only:
+                - canary
+
+      - deploy:
+          requires:
+            - integration-test
+          name: deploy-staging
+          environment: staging
+          context: aws-deployments
+          filters:
+            branches:
+              only:
+                - staging
